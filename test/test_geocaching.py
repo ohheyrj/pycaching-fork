@@ -1,5 +1,3 @@
-import itertools
-import unittest
 from unittest.mock import patch
 
 from geopy.distance import great_circle
@@ -29,65 +27,56 @@ class TestMethods(LoggedInTest):
     def test_search(self):
         with self.subTest("normal"):
             tolerance = 2
-            expected = {"GC5VJ0P", "GC41FJC", "GC50AQ6", "GC167Y7", "GC7RR74", "GC167Y7"}
+            expected = {
+                "GC50AQ6",
+                "GC9T8WJ",
+                "GC8Z14D",
+                "GC167Y7",
+                "GC7TT7T",
+                "GC3TF1K",
+                "GC77PV1",
+                "GC84801",
+                "GC5MGHV",
+                "GC5VJ0P",
+                "GC9PN94",
+                "GC161KR",
+                "GC7GNTE",
+                "GC1M7GP",
+                "GC5EDMF",
+                "GC868VY",
+                "GC44001",
+                "GC3P972",
+                "GC86RK3",
+                "GC9TRPD",
+            }
             with self.recorder.use_cassette("geocaching_search"):
                 found = {cache.wp for cache in self.gc.search(Point(49.733867, 13.397091), 20)}
             self.assertGreater(len(expected & found), len(expected) - tolerance)
 
-        with self.subTest("pagging"):
+        with self.subTest("pagination"):
             with self.recorder.use_cassette("geocaching_search_pagination"):
-                caches = list(self.gc.search(Point(49.733867, 13.397091), 100))
+                caches = list(self.gc.search(Point(49.733867, 13.397091), 100, per_query=50))
             self.assertNotEqual(caches[0], caches[50])
 
-    @unittest.expectedFailure
+        with self.subTest("sort_str"):
+            with self.recorder.use_cassette("geocaching_search"):
+                caches = list(self.gc.search(Point(49.733867, 13.397091), 20, sort_by="datelastvisited"))
+            self.assertGreater(len(expected & found), len(expected) - tolerance)
+
+        with self.subTest("sort"):
+            with self.recorder.use_cassette("geocaching_search"):
+                caches = list(self.gc.search(Point(49.733867, 13.397091), 20, sort_by=SortOrder.date_last_visited))
+            self.assertGreater(len(expected & found), len(expected) - tolerance)
+
     def test_search_quick(self):
         """Perform quick search and check found caches"""
-        # at time of writing, there were exactly 16 caches in this area + one PM only
-        expected_cache_num = 16
-        tolerance = 7
         rect = Rectangle(Point(49.73, 13.38), Point(49.74, 13.40))
 
-        with self.subTest("normal"):
-            with self.recorder.use_cassette("geocaching_quick_normal"):
-                # Once this feature is fixed, the corresponding cassette will have to be deleted
-                # and re-recorded.
-                res = [c.wp for c in self.gc.search_quick(rect)]
-            for wp in ["GC41FJC", "GC17E8Y", "GC383XN"]:
-                self.assertIn(wp, res)
-            # but 108 caches larger tile
-            self.assertLess(len(res), 130)
-            self.assertGreater(len(res), 90)
-
-        with self.subTest("strict handling of cache coordinates"):
-            with self.recorder.use_cassette("geocaching_quick_strictness"):
-                res = list(self.gc.search_quick(rect, strict=True))
-            self.assertLess(len(res), expected_cache_num + tolerance)
-            self.assertGreater(len(res), expected_cache_num - tolerance)
-
-        with self.subTest("larger zoom - more precise"):
-            with self.recorder.use_cassette("geocaching_quick_zoom"):
-                res1 = list(self.gc.search_quick(rect, strict=True, zoom=15))
-                res2 = list(self.gc.search_quick(rect, strict=True, zoom=14))
-            for res in res1, res2:
-                self.assertLess(len(res), expected_cache_num + tolerance)
-                self.assertGreater(len(res), expected_cache_num - tolerance)
-            for c1, c2 in itertools.product(res1, res2):
-                self.assertLess(c1.location.precision, c2.location.precision)
-
-    @unittest.expectedFailure
-    def test_search_quick_match_load(self):
-        """Test if quick search results matches exact cache locations."""
-        rect = Rectangle(Point(49.73, 13.38), Point(49.74, 13.39))
-        with self.recorder.use_cassette("geocaching_matchload"):
-            # at commit time, this test is an allowed failure. Once this feature is fixed, the
-            # corresponding cassette will have to be deleted and re-recorded.
-            caches = list(self.gc.search_quick(rect, strict=True, zoom=15))
-            for cache in caches:
-                try:
-                    cache.load()
-                    self.assertIn(cache.location, rect)
-                except PMOnlyException:
-                    pass
+        with self.recorder.use_cassette("geocaching_quick_search"):
+            res = [c.wp for c in self.gc.search_quick(rect)]
+        for wp in ["GC11PRW", "GC161KR", "GC167Y7"]:
+            self.assertIn(wp, res)
+        self.assertEqual(len(res), 11)
 
     def test__try_getting_cache_from_guid(self):
         # get "normal" cache from guidpage
@@ -106,12 +95,37 @@ class TestMethods(LoggedInTest):
                 pass
 
 
+class TestAdvancedSearch(LoggedInTest):
+    def test_search(self):
+        with self.recorder.use_cassette("advanced_search"):
+            # https://www.geocaching.com/play/search?st=Prague%2C+Hlavní+město+Praha&ot=query&asc=false&sort=distance
+            results = self.gc.advanced_search(
+                options={
+                    "st": "Prague, Hlavní město Praha",
+                    "ot": "query",
+                    "asc": "false",
+                    "sort": "distance",
+                },
+                limit=50,
+            )
+            self.assertEqual("GC11JM6", list(results)[0].wp)
+
+    def test_caches_owned_by_geocaching_hq(self):
+        with self.recorder.use_cassette("advanced_search_caches_owned_by_hq"):
+            # https://www.geocaching.com/play/search/?hb=Geocaching+HQ
+            options = {"hb": "Geocaching HQ"}
+            generator = self.gc.advanced_search(options=options)
+            results = list(generator)
+            self.assertGreaterEqual(91, len(results))
+            self.assertEqual("GC1TEZH", results[-1].wp)
+
+
 class TestAPIMethods(LoggedInTest):
     def test_search_rect(self):
         """Perform search by rect and check found caches."""
         rect = Rectangle(Point(49.73, 13.38), Point(49.74, 13.39))
 
-        expected = {"GC1TYYG", "GC11PRW", "GC7JRR5", "GC161KR", "GC1GW54", "GC7KDWE", "GC93HA6", "GCZC5D"}
+        expected = {"GC161KR", "GCA29DP", "GCZC5D", "GC11PRW", "GC7JRR5", "GC7KDWE", "GC1GW54"}
 
         orig_wait_for = TooManyRequestsError.wait_for
         with self.recorder.use_cassette("geocaching_search_rect") as vcr:
@@ -138,9 +152,25 @@ class TestAPIMethods(LoggedInTest):
                         try:
                             distances.append(great_circle(cache.location, origin).meters)
                         except PMOnlyException:
-                            # can happend when getting accurate location
+                            # can happen when getting accurate location
                             continue
                     self.assertEqual(distances, sorted(distances))
+
+                with self.subTest("sort by distance reverse"):
+                    origin = Point.from_string("N 49° 44.230 E 013° 22.858")
+                    caches = list(self.gc.search_rect(rect, sort_by=SortOrder.distance, reverse=True, origin=origin))
+                    waypoints = {cache.wp for cache in caches}
+                    self.assertSetEqual(waypoints, expected)
+
+                    # Check if caches are reverse sorted by distance to origin
+                    distances = []
+                    for cache in caches:
+                        try:
+                            distances.append(great_circle(cache.location, origin).meters)
+                        except PMOnlyException:
+                            # can happen when getting accurate location
+                            continue
+                    self.assertEqual(distances, sorted(distances, reverse=True))
 
                 with self.subTest("sort by different criteria"):
                     for sort_by in SortOrder:

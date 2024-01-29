@@ -3,7 +3,7 @@ import unittest
 from datetime import date
 from unittest import mock
 
-from pycaching.cache import Cache, Size, Type, Waypoint
+from pycaching.cache import Cache, Size, Status, Type, Waypoint
 from pycaching.errors import LoadError, PMOnlyException
 from pycaching.errors import ValueError as PycachingValueError
 from pycaching.geo import Point
@@ -24,7 +24,7 @@ class TestProperties(unittest.TestCase):
             name="Testing",
             type=Type.traditional,
             location=Point(),
-            state=True,
+            status=Status.enabled,
             found=False,
             size=Size.micro,
             difficulty=1.5,
@@ -33,7 +33,8 @@ class TestProperties(unittest.TestCase):
             hidden=date(2000, 1, 1),
             attributes={"onehour": True, "kids": False, "available": True},
             summary="text",
-            description="long text",
+            description="Luftballon",
+            description_html="<b>Luftballon</b>",
             hint="rot13",
             favorites=0,
             pm_only=False,
@@ -115,6 +116,12 @@ class TestProperties(unittest.TestCase):
     def test_state(self):
         self.assertEqual(self.c.state, True)
 
+    def test_status(self):
+        self.assertEqual(self.c.status, Status.enabled)
+
+    def test_status_name(self):
+        self.assertEqual(self.c.status.name, "enabled")
+
     def test_found(self):
         self.assertEqual(self.c.found, False)
 
@@ -158,7 +165,6 @@ class TestProperties(unittest.TestCase):
                 self.c.hidden = None
 
     def test_visited(self):
-
         with self.subTest("automatic str conversion"):
             self.c.visited = "1/30/2000"
             self.assertEqual(self.c.visited, date(2000, 1, 30))
@@ -182,7 +188,10 @@ class TestProperties(unittest.TestCase):
         self.assertEqual(self.c.summary, "text")
 
     def test_description(self):
-        self.assertEqual(self.c.description, "long text")
+        self.assertEqual(self.c.description, "Luftballon")
+
+    def test_description_html(self):
+        self.assertEqual(self.c.description_html, "<b>Luftballon</b>")
 
     def test_hint(self):
         self.assertEqual(self.c.hint, "rot13")
@@ -231,6 +240,18 @@ class TestMethods(LoggedInTest):
                     cache = Cache(self.gc, "GC123456")
                     cache.load()
 
+        with self.subTest("description"):
+            with self.recorder.use_cassette("cache_normal_normal"):
+                cache = Cache(self.gc, "GC4808G")
+                self.assertIn("Tuhle zprávu ti nepíšu proto, abych ti řekl, že ", cache.description)
+                self.assertIn(
+                    (
+                        ';background-color:black;border:1px solid black;padding:20px;">'
+                        "Tuhle zprávu ti nepíšu proto, abych ti řekl, že "
+                    ),
+                    cache.description_html,
+                )
+
     def test_load_quick(self):
         with self.subTest("normal"):
             with self.recorder.use_cassette("cache_quick_normal"):
@@ -273,7 +294,17 @@ class TestMethods(LoggedInTest):
                 },
             )
             self.assertEqual(cache.summary, "Gibt es das Luftschloss wirklich?")
-            self.assertIn("Seit dem 16.", cache.description)
+            self.assertIn(
+                " funktioniert, der kann gerne eine Mail schreiben.\r\nSeit dem 16. Jahrhundert steht die ",
+                cache.description,
+            )
+            self.assertIn(
+                (
+                    " funktioniert, der kann gerne eine Mail schreiben.</b></p>\r\n"
+                    "Seit dem 16. Jahrhundert steht die "
+                ),
+                cache.description_html,
+            )
             self.assertEqual(cache.hint, "Das ist nicht nötig")
             self.assertGreater(cache.favorites, 350)
             self.assertEqual(len(cache.waypoints), 2)
@@ -463,3 +494,46 @@ class TestWaypointProperties(unittest.TestCase):
 
     def test_str(self):
         self.assertEqual(str(self.w), "id")
+
+
+class TestCacheStatus(LoggedInTest):
+    def test_cache_status(self):
+        with self.subTest("Enabled"):
+            cache = Cache(self.gc, "GC8CKQQ")
+            with self.recorder.use_cassette("cache_status_enabled"):
+                self.assertEqual(Status.enabled, cache.status)
+
+        with self.subTest("Disabled"):
+            cache = Cache(self.gc, "GC7Y77T")
+            with self.recorder.use_cassette("cache_status_disabled"):
+                self.assertEqual(Status.disabled, cache.status)
+
+        with self.subTest("Archived"):
+            cache = Cache(self.gc, "GC1PAR2")
+            with self.recorder.use_cassette("cache_status_archived"):
+                self.assertEqual(Status.archived, cache.status)
+
+        with self.subTest("Locked"):
+            cache = Cache(self.gc, "GC10")
+            with self.recorder.use_cassette("cache_status_locked"):
+                self.assertEqual(Status.locked, cache.status)
+
+        with self.subTest("Enabled > Quick load"):
+            cache = Cache(self.gc, "GC8CKQQ")
+            with self.recorder.use_cassette("cache_status_enabled_load_quick"):
+                cache.load_quick()
+                self.assertEqual(Status.enabled, cache.status)
+
+
+class TestHint(LoggedInTest):
+    def test_hint(self):
+        with self.subTest("Lazy loading"):
+            cache = Cache(self.gc, "GC9HJ2J")
+            with self.recorder.use_cassette("cache_hint_lazy_loading"):
+                self.assertEqual(cache.hint, "[CZ:] plot, nahore, vpravo; fotohint\n[EN:] fence, up, right; photohint")
+
+        with self.subTest("Load by guid"):
+            cache = Cache(self.gc, "GC9HJ2J")
+            with self.recorder.use_cassette("cache_hint_load_by_guid"):
+                cache.load_by_guid()
+                self.assertEqual(cache.hint, "[CZ:] plot, nahore, vpravo; fotohint\n[EN:] fence, up, right; photohint")

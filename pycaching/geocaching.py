@@ -6,21 +6,21 @@ import json
 import logging
 import re
 import subprocess
-import warnings
 from os import path
-from typing import Optional, Union
-from urllib.parse import parse_qs, urljoin, urlparse
+from typing import Generator, Optional, Union
+from urllib.parse import urljoin
 
 import bs4
 import requests
-from bs4.element import Script
+from bs4.element import Script  # Direct import as `bs4.Script` requires version >= 4.9.1.
 
-from pycaching.cache import Cache, Size
+from pycaching.cache import Cache
 from pycaching.errors import Error, LoginFailedException, NotLoggedInException, PMOnlyException, TooManyRequestsError
 from pycaching.geo import Point, Rectangle
 from pycaching.log import Log
 from pycaching.log import Type as LogType
 from pycaching.trackable import Trackable
+from pycaching.util import deprecated
 
 
 class SortOrder(enum.Enum):
@@ -52,7 +52,7 @@ class Geocaching(object):
         "search": "play/search",
         "search_more": "play/search/more-results",
         "my_logs": "my/logs.aspx",
-        "api_search": "api/proxy/web/search",
+        "api_search": "api/proxy/web/search/v2",
     }
     _credentials_file = ".gc_credentials"
 
@@ -155,6 +155,10 @@ class Geocaching(object):
             return
         else:
             self.logout()
+
+            if after_login_page.find("div", class_="g-recaptcha"):
+                raise LoginFailedException("CAPTCHA is required to login to the site.")
+
             raise LoginFailedException("Cannot login to the site (probably wrong username or password).")
 
     def _load_credentials(self, username=None):
@@ -239,170 +243,88 @@ class Geocaching(object):
         m = re.search(r'"username":\s*"(.*)"', js_content)
         return m.group(1) if m else None
 
-    def search(self, point, limit=float("inf")):
-        """Return a generator of caches around some point.
+    def search(
+        self,
+        point: Point,
+        limit: int = float("inf"),
+        *,
+        sort_by: Union[str, SortOrder] = SortOrder.date_last_visited,
+        reverse: bool = False,
+        per_query: int = 200,
+        wait_sleep: bool = True,
+    ) -> Generator[Optional[Cache], None, None]:
+        """Search for caches around a specified location using a search API.
 
-        Search for caches around some point by loading search pages and parsing the data from these
-        pages. Yield :class:`.Cache` objects filled with data from search page. You can provide limit
-        as a convenient way to stop generator after certain number of caches.
-
-        :param .geo.Point point: Search center point.
-        :param int limit: Maximum number of caches to generate.
+        :param point: The :class:`.geo.Point` object representing the center point of the search.
+        :param limit: The maximum number of caches to load.
+            Defaults to infinity.
+        :param sort_by: The criterion to sort the caches by.
+            Defaults to :code:`SortOrder.date_last_visited`.
+        :param reverse: If :code:`True`, the order of the results is reversed.
+            Defaults to :code:`False`.
+        :param per_query: The number of caches to request in each query.
+            Defaults to :code:`200`.
+        :param wait_sleep: In case of rate limits exceeding, wait appropriate time
+            if set to :code:`True`, otherwise just yield :code:`None`.
+            Defaults to :code:`True`.
+        :return: A generator that yields :class:`.Cache` objects.
         """
-        logging.info("Searching at {}".format(point))
 
-        start_index = 0
-        while True:
-            # get one page
-            geocaches_table, whole_page = self._search_get_page(point, start_index)
-            rows = geocaches_table.find_all("tr")
+        if not isinstance(sort_by, SortOrder):
+            sort_by = SortOrder(sort_by)
 
-            # leave loop if there are no (more) results
-            if not rows:
-                return
-
-            # prepare language-dependent mappings
-            if start_index == 0:
-                cache_sizes_filter_wrapper = whole_page.find("div", class_="cache-sizes-wrapper")
-                localized_size_mapping = {
-                    # key = "Small" (localized), value = Size.small
-                    label.find("span").text.strip(): Size.from_number(label.find("input").get("value"))
-                    for label in cache_sizes_filter_wrapper.find_all("label")
-                }
-
-            # parse caches in result
-            for start_index, row in enumerate(rows, start_index):
-
-                limit -= 1  # handle limit
-                if limit < 0:
-                    return
-
-                # parse raw data
-                cache_details = row.find("span", "cache-details").text.split("|")
-                wp = cache_details[1].strip()
-
-                # create and fill cache object
-                # values are sanitized and converted in Cache setters
-                c = Cache(self, wp)
-                c.type = cache_details[0]
-                c.name = row.find("span", "cache-name").text
-                badge = row.find("svg", class_="badge")
-                c.found = "found" in str(badge) if badge is not None else False
-                c.favorites = row.find(attrs={"data-column": "FavoritePoint"}).text
-                c.state = not (row.get("class") and "disabled" in row.get("class"))
-                c.pm_only = row.find("td", "pm-upsell") is not None
-
-                if c.pm_only:
-                    # PM only caches doesn't have other attributes filled in
-                    yield c
-                    continue
-
-                c.size = localized_size_mapping[row.find(attrs={"data-column": "ContainerSize"}).text.strip()]
-                c.difficulty = row.find(attrs={"data-column": "Difficulty"}).text
-                c.terrain = row.find(attrs={"data-column": "Terrain"}).text
-                c.hidden = row.find(attrs={"data-column": "PlaceDate"}).text
-                c.author = row.find("span", "owner").text[3:]  # delete "by "
-
-                logging.debug("Cache parsed: {}".format(c))
-                yield c
-
-            start_index += 1
-
-    def _search_get_page(self, point, start_index):
-        """Return one page for standard search as class:`bs4.BeautifulSoup` object.
-
-        :param .geo.Point point: Search center point.
-        :param int start_index: Determines the page. If start_index is greater than zero, this
-            method will use AJAX andpoint which is much faster.
-        """
-        assert hasattr(point, "format") and callable(point.format)
-        logging.debug("Loading page from start_index {}".format(start_index))
-
-        if start_index == 0:
-            # first request has to load normal search page
-            logging.debug("Using normal search endpoint")
-
-            # make request
-            res = self._request(
-                self._urls["search"],
-                params={
-                    "origin": point.format_decimal(),
-                },
-            )
-            return res.find(id="geocaches"), res
-
-        else:
-            # other requests can use AJAX endpoint
-            logging.debug("Using AJAX search endpoint")
-
-            # make request
-            res = self._request(
-                self._urls["search_more"],
-                params={
-                    "origin": point.format_decimal(),
-                    "startIndex": start_index,
-                    "ssvu": 2,
-                    "selectAll": "false",
-                },
-                expect="json",
-            )
-
-            return bs4.BeautifulSoup(res["HtmlString"].strip(), "html.parser"), None
-
-    def search_quick(self, area, *, strict=False, zoom=None):
-        """Return a generator of caches in some area.
-
-        Area is converted to map tiles, each tile is then loaded and :class:`.Cache` objects are then
-        created from its blocks.
-
-        :param bool strict: Whether to return caches strictly in the `area` and discard others.
-        :param int zoom: Zoom level of tiles. You can also specify it manually, otherwise it is
-            automatically determined for whole :class:`.Area` to fit into one :class:`.Tile`. Higher
-            zoom level is more precise, but requires more tiles to be loaded.
-        """
-        # FIXME
-        warnings.warn(
-            "Quick search is temporary disabled because of Groundspeak breaking change. "
-            "If you would like to use it, please consider helping with this issue: "
-            "https://github.com/tomasbedrich/pycaching/issues/75"
+        return self.advanced_search(
+            {
+                "origin": "{},{}".format(point.latitude, point.longitude),
+                "asc": str(not reverse).lower(),
+                "sort": sort_by.value,
+            },
+            per_query=per_query,
+            limit=limit,
+            wait_sleep=wait_sleep,
         )
-        raise NotImplementedError()
 
-        # logging.info("Searching quick in {}".format(area))
-        #
-        # tiles = area.to_tiles(self, zoom)
-        # # TODO process tiles by multiple workers
-        # for tile in tiles:
-        #     for block in tile.blocks:
-        #         cache = Cache.from_block(block)
-        #         if strict and cache.location not in area:
-        #             # if strict mode is on and cache is not in area
-        #             continue
-        #         else:
-        #             # can yield more caches (which are not exactly in desired area)
-        #             yield cache
+    @deprecated
+    def search_quick(self, area):
+        """Search for caches in a specified :class:`.Rectangle` area.
 
-    # add some shortcuts ------------------------------------------------------
+        :param rect: The :class:`.Rectangle` object representing the search area.
+        :type rect: geo.Rectangle
+        :return: A generator that yields :class:`.Cache` objects.
+        :rtype: Generator[Optional[Cache], None, None]
+        """
+
+        return self.search_rect(area)
 
     def search_rect(
         self,
         rect: Rectangle,
+        limit: int = float("inf"),
         *,
-        per_query: int = 200,
         sort_by: Union[str, SortOrder] = SortOrder.date_last_visited,
+        reverse: bool = False,
+        per_query: int = 200,
         origin: Optional[Point] = None,
-        wait_sleep: bool = True
-    ):
-        """
-        Return a generator of caches in given Rectange area.
+        wait_sleep: bool = True,
+    ) -> Generator[Optional[Cache], None, None]:
+        """Search for caches in a specified :class:`.Rectangle` area using a search API.
 
-        :param rect: Search area.
-        :param int per_query: Number of caches requested in single query.
-        :param sort_by: Order cached by given criterion.
-        :param origin: Origin point for search by distance.
-        :param wait_sleep: In case of rate limits exceeding, wait appropriate time if set True,
-            otherwise just yield None.
+        :param rect: The :class:`.Rectangle` object representing the search area.
+        :param limit: The maximum number of caches to load.
+            Defaults to infinity.
+        :param sort_by: The criterion to sort the caches by.
+            Defaults to :code:`SortOrder.date_last_visited`.
+        :param reverse: If :code:`True`, the order of the results is reversed.
+            Defaults to :code:`False`.
+        :param per_query: The number of caches to request in each query.
+            Defaults to :code:`200`.
+        :param origin: The origin point for search by distance, required when sorting by distance.
+        :param wait_sleep: In case of rate limits exceeding, wait appropriate time
+            if set to :code:`True`, otherwise just yield :code:`None`.
+            Defaults to :code:`True`.
+        :return: A generator that yields :class:`.Cache` objects.
         """
+
         if not isinstance(sort_by, SortOrder):
             sort_by = SortOrder(sort_by)
 
@@ -413,9 +335,7 @@ class Geocaching(object):
                 rect.corners[1].latitude,
                 rect.corners[1].longitude,
             ),
-            "take": per_query,
-            "asc": "true",
-            "skip": 0,
+            "asc": str(not reverse).lower(),
             "sort": sort_by.value,
         }
 
@@ -423,8 +343,54 @@ class Geocaching(object):
             assert isinstance(origin, Point)
             params["origin"] = "{},{}".format(origin.latitude, origin.longitude)
 
+        return self.advanced_search(
+            params,
+            per_query=per_query,
+            limit=limit,
+            wait_sleep=wait_sleep,
+        )
+
+    def advanced_search(
+        self,
+        options: dict,
+        limit: int = float("inf"),
+        per_query: int = 200,
+        wait_sleep: bool = True,
+    ) -> Generator[Optional[Cache], None, None]:
+        """Perform an advanced search for geocaches with specific search criteria.
+
+        The search is performed using the options provided in the :code:`options` parameter.
+        Example of the :code:`options` parameter::
+
+            # https://www.geocaching.com/play/search?owner[0]=Geocaching%20HQ&a=0
+            options = {"owner[0]": "Geocaching HQ", "a": "0"}
+
+        :param options: A dictionary of search options.
+        :param limit: The maximum number of caches to load.
+            Defaults to infinity.
+        :param per_query: The number of caches to request in each query.
+            Defaults to :code:`200`.
+        :param wait_sleep: In case of rate limits exceeding, wait appropriate time
+            if set to :code:`True`, otherwise just yield :code:`None`.
+            Defaults to :code:`True`.
+        :return: A generator that yields :class:`.Cache` objects.
+        """
+
+        if limit <= 0:
+            return
+
+        take_amount = min(limit, per_query)
+
+        params = options.copy()
+        params.update(
+            {
+                "take": take_amount,
+                "skip": 0,
+            }
+        )
+
         total, offset = None, 0
-        while (total is None) or (offset < total):
+        while (offset < limit) and ((total is None) or (offset < total)):
             params["skip"] = offset
 
             try:
@@ -440,7 +406,9 @@ class Geocaching(object):
                 yield Cache._from_api_record(self, record)
 
             total = resp["total"]
-            offset += per_query
+            offset += take_amount
+
+    # add some shortcuts ------------------------------------------------------
 
     def geocode(self, location):
         """Return a :class:`.Point` object from geocoded location.
@@ -526,8 +494,12 @@ class Geocaching(object):
                 break
 
             link = row.find(class_="ImageLink")["href"]
-            guid = parse_qs(urlparse(link).query)["guid"][0]
-            current_cache = self._try_getting_cache_from_guid(guid)
+
+            # This line extracts a GC code from the cache URL
+            # Example: https://www.geocaching.com/geocache/GC12345 -> GC12345
+            wp = link.split("/")[4]
+
+            current_cache = self.get_cache(wp)
             date = row.find_all("td")[2].text.strip()
             current_cache.visited = date
 

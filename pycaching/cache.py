@@ -13,7 +13,7 @@ from pycaching.geo import Point
 from pycaching.log import Log
 from pycaching.log import Type as LogType
 from pycaching.trackable import Trackable
-from pycaching.util import lazy_loaded, parse_date, rot13
+from pycaching.util import deprecated, lazy_loaded, parse_date, rot13
 
 # prefix _type() function to avoid collisions with cache type
 _type = type
@@ -145,7 +145,6 @@ class Cache(object):
             content.find(class_="HalfRight AlignRight").p.text.strip().partition(":")[2].strip()
         )
         cache_info["location"] = Point.from_string(content.find(class_="LatLong").text.strip())
-        cache_info["state"] = None  # not on the page
         attributes = [
             img["src"].split("/")[-1].partition(".")[0].rpartition("-")
             for img in content.find(class_="sortables").find_all("img")
@@ -154,10 +153,12 @@ class Cache(object):
         cache_info["attributes"] = {attr_name: attr_setting == "yes" for attr_name, _, attr_setting in attributes}
         if "attribute" in cache_info["attributes"]:  # 'blank' attribute
             del cache_info["attributes"]["attribute"]
-        cache_info["summary"] = content.find("h2", text="Short Description").find_next("div").text
-        cache_info["description"] = content.find("h2", text="Long Description").find_next("div").text
+        cache_info["summary"] = content.find("h2", string="Short Description").find_next("div").text
+        raw_description = content.find("h2", string="Long Description").find_next("div")
+        cache_info["description"] = raw_description.text
+        cache_info["description_html"] = str(raw_description)
         hint = content.find(id="uxEncryptedHint")
-        cache_info["hint"] = hint.text.strip() if hint else None
+        cache_info["hint"] = hint.get_text(separator="\n") if hint else None
         cache_info["waypoints"] = Waypoint.from_html(content, table_id="Waypoints")
         cache_info["log_counts"] = Cache._get_log_counts_from_print_page(soup)
         return Cache(geocaching, **cache_info)
@@ -170,8 +171,8 @@ class Cache(object):
             wp=record["code"],
             name=record["name"],
             type=Type.from_number(record["geocacheType"]),
-            state=Status(record["cacheStatus"]) == Status.enabled,
-            found=record["userFound"],
+            status=Status(record["cacheStatus"]),
+            found="userFound" in record,
             size=Size.from_number(record["containerType"]),
             difficulty=record["difficulty"],
             terrain=record["terrain"],
@@ -213,7 +214,7 @@ class Cache(object):
             "type",
             "location",
             "original_location",
-            "state",
+            "status",
             "found",
             "size",
             "difficulty",
@@ -223,6 +224,7 @@ class Cache(object):
             "attributes",
             "summary",
             "description",
+            "description_html",
             "hint",
             "favorites",
             "pm_only",
@@ -405,18 +407,31 @@ class Cache(object):
 
     @property
     @lazy_loaded
+    @deprecated
     def state(self):
         """The cache status.
 
-        :code:`True` if cache is enabled, :code:`False` if cache is disabled.
+        :code:`True` if cache is enabled, otherwise :code:`False`.
 
         :type: :class:`bool`
         """
-        return self._state
+        return self._status == Status.enabled
 
-    @state.setter
-    def state(self, state):
-        self._state = bool(state)
+    @property
+    @lazy_loaded
+    def status(self):
+        """The cache status (Enabled, Disabled, Archived, Unpublished, Locked).
+
+        :type: :class:`.cache.Status`
+        """
+        return self._status
+
+    @status.setter
+    def status(self, status):
+        if isinstance(status, Status):
+            self._status = status
+        else:
+            raise errors.ValueError("Passed object is not Status instance.")
 
     @property
     @lazy_loaded
@@ -603,6 +618,20 @@ class Cache(object):
 
     @property
     @lazy_loaded
+    def description_html(self):
+        """The cache long description in raw HTML.
+
+        :type: :class:`str`
+        """
+        return self._description_html
+
+    @description_html.setter
+    def description_html(self, description):
+        description = str(description).strip()
+        self._description_html = description
+
+    @property
+    @lazy_loaded
     def hint(self):
         """The cache hint.
 
@@ -780,7 +809,7 @@ class Cache(object):
 
         self.location = Point.from_string(root.find(id="uxLatLon").text)
 
-        self.state = root.find("ul", "OldWarning") is None
+        self.status = Status.from_cache_details(root)
 
         log_image = root.find(id="ctl00_ContentBody_GeoNav_logTypeImage")
         if log_image:
@@ -799,9 +828,11 @@ class Cache(object):
         }
 
         self.summary = root.find(id="ctl00_ContentBody_ShortDescription").text
-        self.description = root.find(id="ctl00_ContentBody_LongDescription").text
+        raw_description = root.find(id="ctl00_ContentBody_LongDescription")
+        self.description = raw_description.text
+        self.description_html = str(raw_description)
 
-        self.hint = rot13(root.find(id="div_hint").text.strip())
+        self.hint = rot13(root.find(id="div_hint").get_text(separator="\n"))
 
         favorites = root.find("span", "favorite-value")
         if favorites:
@@ -837,8 +868,11 @@ class Cache(object):
         """Load basic cache details.
 
         Use information from geocaching map tooltips. Therefore loading is very quick, but
-        the only loaded properties are: `name`, `type`, `state`, `size`, `difficulty`, `terrain`,
+        the only loaded properties are: `name`, `type`, `size`, `difficulty`, `terrain`,
         `hidden`, `author`, `favorites` and `pm_only`.
+        It also loads `status`, but only for enabled caches. For other states, it can't be
+        completely determined (can't distinguish between archived and locked caches), so
+        lazy loading is used.
 
         :raise .LoadError: If cache loading fails (probably because of not existing cache).
         """
@@ -853,7 +887,12 @@ class Cache(object):
         # prettify data
         self.name = data["name"]
         self.type = Type.from_string(data["type"]["text"])
-        self.state = data["available"]
+
+        # We can fill in status correctly only for enabled caches
+        # (locked caches are considered archived)
+        if data["available"]:
+            self.status = Status.enabled
+
         self.size = Size.from_string(data["container"]["text"])
         self.difficulty = data["difficulty"]["text"]
         self.terrain = data["terrain"]["text"]
@@ -902,9 +941,9 @@ class Cache(object):
 
         # TODO do NOT use English phrases like "Placed by" to search for attributes
 
-        self.author = content.find("p", text=re.compile("Placed by:")).text.split("\r\n")[2].strip()
+        self.author = content.find("p", string=re.compile("Placed by:")).text.split("\r\n")[2].strip()
 
-        hidden_p = content.find("p", text=re.compile("Placed Date:"))
+        hidden_p = content.find("p", string=re.compile("Placed Date:"))
         self.hidden = hidden_p.text.replace("Placed Date:", "").strip()
 
         attr_img = content.find_all("img", src=re.compile(r"\/attributes\/"))
@@ -913,13 +952,15 @@ class Cache(object):
             name: appendix.startswith("yes") for name, appendix in attributes_raw if not appendix.startswith("blank")
         }
 
-        self.summary = content.find("h2", text="Short Description").find_next("div").text
+        self.summary = content.find("h2", string="Short Description").find_next("div").text
 
-        self.description = content.find("h2", text="Long Description").find_next("div").text
+        raw_description = content.find("h2", string="Long Description").find_next("div")
+        self.description = raw_description.text
+        self.description_html = str(raw_description)
 
-        self.hint = content.find(id="uxEncryptedHint").text
+        self.hint = content.find(id="uxEncryptedHint").get_text(separator="\n")
 
-        self.favorites = content.find("strong", text=re.compile("Favorites:")).parent.text.split()[-1]
+        self.favorites = content.find("strong", string=re.compile("Favorites:")).parent.text.split()[-1]
 
         self.waypoints = Waypoint.from_html(content, "Waypoints")
 
@@ -1058,7 +1099,6 @@ class Cache(object):
                 return
 
             for log_data in logbook_page:
-
                 limit -= 1  # handle limit
                 if limit < 0:
                     return
@@ -1100,7 +1140,6 @@ class Cache(object):
         names = [re.split(r"[\<\>]", str(link))[2] for link in links if "track" in link.get("href")]
 
         for name, url in zip(names, urls):
-
             limit -= 1  # handle limit
             if limit < 0:
                 return
@@ -1412,3 +1451,17 @@ class Status(enum.IntEnum):
     disabled = 1
     archived = 2
     unpublished = 3
+    locked = 4
+
+    @classmethod
+    def from_cache_details(cls, soup):
+        if soup.find(id="ctl00_ContentBody_disabledMessage"):
+            return Status.disabled
+        elif soup.find(id="ctl00_ContentBody_archivedMessage"):
+            return Status.archived
+        elif soup.find(id="unpublishedMessage") or soup.find(id="unpublishedReviewerNoteMessage"):
+            return Status.unpublished
+        elif soup.find(id="ctl00_ContentBody_lockedMessage"):
+            return Status.locked
+        else:
+            return Status.enabled
